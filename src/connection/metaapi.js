@@ -5,10 +5,12 @@ let account = null;
 const { default: MetaApi } = pkg;
 
 let connection = null;
+let streamingConnection = null;
 
 export async function initConnection() {
   const token     = process.env.META_API_TOKEN;
   const accountId = process.env.META_API_ACCOUNT_ID;
+  console.log("DEBUG VERSION:", process.env.METAAPI_DEBUG_VERSION);
 
   console.log("⏳ Connecting to MT5 via MetaApi...");
 
@@ -34,4 +36,67 @@ export function getConnection() {
 export function getAccount() {
   if (!account) throw new Error("MT5 not connected yet.");
   return account;
+}
+
+
+
+// =============================================================================
+// INIT STREAMING CONNECTION
+// =============================================================================
+
+export async function initStreamingConnection() {
+
+    if (!account) {
+
+        throw new Error(
+            "MT5 not connected yet."
+        );
+    }
+
+    if (streamingConnection) {
+
+        return streamingConnection;
+    }
+
+    console.log(
+        "⏳ Creating MT5 streaming connection..."
+    );
+
+    streamingConnection =
+        account.getStreamingConnection();
+
+    await streamingConnection.connect();
+
+    console.log(
+        "✅ Streaming connection connected"
+    );
+
+    console.log(
+        "⏳ Waiting for streaming synchronization..."
+    );
+
+    await streamingConnection.waitSynchronized();
+
+    console.log(
+        "✅ Streaming connection synchronized"
+    );
+
+    return streamingConnection;
+}
+
+
+// =============================================================================
+// GET STREAMING CONNECTION
+// =============================================================================
+
+export function getStreamingConnection() {
+
+    if (!streamingConnection) {
+
+        throw new Error(
+            "MT5 streaming connection not initialized yet."
+        );
+    }
+
+    return streamingConnection;
 }

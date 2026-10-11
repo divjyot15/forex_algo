@@ -23,7 +23,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
     try {
 
         console.log(
-            `⏳ Fetching full August 2026 ${timeframe} candles via MetaApi...`
+            `⏳ Fetching March–August 2026 ${timeframe} candles via MetaApi...`
         );
 
         const account = getAccount();
@@ -33,7 +33,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
         // ================================================================
 
         const startDate = new Date(
-            "2026-08-01T00:00:00.000Z"
+            "2026-03-01T00:00:00.000Z"
         );
 
         const endDate = new Date(
@@ -115,7 +115,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
             );
 
             // ============================================================
-            // WE HAVE REACHED THE START OF AUGUST
+            // WE HAVE REACHED THE START OF MARCH
             // ============================================================
 
             if (oldestTime <= startDate) {
@@ -143,7 +143,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
         }
 
         // ================================================================
-        // FILTER TO EXACT AUGUST RANGE
+        // FILTER TO EXACT MARCH–AUGUST RANGE
         // ================================================================
 
         allCandles = allCandles.filter(candle => {
@@ -4486,19 +4486,22 @@ async function main() {
     const watcher =
         new FiveMinuteEntryWatcher();
 
-        const backtester =
+         const backtester =
     new BacktestEngine({
 
         initialBalance: 100000,
 
         riskPercent: 0.75,
 
-        pipSize: 0.01,
+        // XAUUSD:
+        // 1 pip = $0.10 price movement
+        pipSize: 0.10,
 
-        slBufferPips: 5,
+        // SL buffer = $0.50 price distance
+        slBuffer: 0.50,
 
+        // TP distances
         tp1Pips: 80,
-
         tp2Pips: 120,
 
         contractSize: 100

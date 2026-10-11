@@ -1,5 +1,13 @@
 import dotenv from "dotenv";
 dotenv.config();
+import fs from "fs";
+import path from "path";
+
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 
 import {
     getAccount,
@@ -22,23 +30,82 @@ const getHistoricalCandles = async (timeframe = "15m") => {
 
     try {
 
-        console.log(
-            `⏳ Fetching full August 2026 ${timeframe} candles via MetaApi...`
-        );
-
-        const account = getAccount();
+        const symbol = "XAUUSD";
 
         // ================================================================
         // TARGET BACKTEST RANGE
         // ================================================================
 
         const startDate = new Date(
-            "2026-08-01T00:00:00.000Z"
+            "2025-09-01T00:00:00.000Z"
         );
 
         const endDate = new Date(
             "2026-09-01T00:00:00.000Z"
         );
+
+        // ================================================================
+        // JSON CACHE FILE
+        // ================================================================
+
+        const cacheDir = path.join(__dirname, "historical-data");
+
+        const cacheFile = path.join(
+            cacheDir,
+            `${symbol}_${timeframe}_2025-09-01_2026-09-01.json`
+        );
+
+        // ================================================================
+        // CHECK IF CACHE EXISTS
+        // ================================================================
+
+        if (fs.existsSync(cacheFile)) {
+
+            console.log(
+                `📂 Found cached ${symbol} ${timeframe} data`
+            );
+
+            console.log(
+                `📖 Loading candles from: ${cacheFile}`
+            );
+
+            const fileData =
+                fs.readFileSync(cacheFile, "utf8");
+
+            const cachedCandles =
+                JSON.parse(fileData);
+
+            console.log(
+                `✅ Loaded ${cachedCandles.length} candles from JSON`
+            );
+
+            if (cachedCandles.length > 0) {
+
+                console.log(
+                    `FIRST: ${cachedCandles[0].time}`
+                );
+
+                console.log(
+                    `LAST:  ${
+                        cachedCandles[cachedCandles.length - 1].time
+                    }`
+                );
+            }
+
+            // IMPORTANT:
+            // No MetaApi call happens here.
+            return cachedCandles;
+        }
+
+        // ================================================================
+        // CACHE NOT FOUND
+        // ================================================================
+
+        console.log(
+            `⚠️ No cached data found. Fetching ${symbol} ${timeframe} from MetaApi...`
+        );
+
+        const account = getAccount();
 
         const LIMIT = 1000;
 
@@ -58,7 +125,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
 
             const candles =
                 await account.getHistoricalCandles(
-                    "XAUUSD",
+                    symbol,
                     timeframe,
                     currentEnd,
                     LIMIT
@@ -92,7 +159,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
             allCandles.push(...candles);
 
             // ============================================================
-            // FIND OLDEST CANDLE IN THIS BATCH
+            // FIND OLDEST CANDLE
             // ============================================================
 
             let oldestCandle = candles[0];
@@ -115,7 +182,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
             );
 
             // ============================================================
-            // WE HAVE REACHED THE START OF AUGUST
+            // REACHED START DATE
             // ============================================================
 
             if (oldestTime <= startDate) {
@@ -143,7 +210,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
         }
 
         // ================================================================
-        // FILTER TO EXACT AUGUST RANGE
+        // FILTER EXACT RANGE
         // ================================================================
 
         allCandles = allCandles.filter(candle => {
@@ -157,7 +224,7 @@ const getHistoricalCandles = async (timeframe = "15m") => {
         });
 
         // ================================================================
-        // REMOVE DUPLICATE CANDLES
+        // REMOVE DUPLICATES
         // ================================================================
 
         const uniqueCandles = new Map();
@@ -181,6 +248,32 @@ const getHistoricalCandles = async (timeframe = "15m") => {
             (a, b) =>
                 new Date(a.time).getTime() -
                 new Date(b.time).getTime()
+        );
+
+        // ================================================================
+        // SAVE TO JSON
+        // ================================================================
+
+        if (!fs.existsSync(cacheDir)) {
+
+            fs.mkdirSync(
+                cacheDir,
+                { recursive: true }
+            );
+        }
+
+        fs.writeFileSync(
+            cacheFile,
+            JSON.stringify(allCandles, null, 2),
+            "utf8"
+        );
+
+        console.log(
+            `\n💾 Saved ${allCandles.length} candles to:`
+        );
+
+        console.log(
+            cacheFile
         );
 
         // ================================================================
@@ -233,7 +326,6 @@ const getHistoricalCandles = async (timeframe = "15m") => {
         return [];
     }
 };
-
 
 // =============================================================================
 // TIME HELPERS

@@ -22,7 +22,7 @@ export async function getPrice(symbol) {
   };
 }
 
-export async function placeOrder({ symbol, type, volume, sl, tp }) {
+export async function placeOrder({ symbol, type, volume, sl, tp, comment = "forex-algo", clientId }) {
 
   const connection = getConnection();
 
@@ -36,7 +36,8 @@ export async function placeOrder({ symbol, type, volume, sl, tp }) {
       sl || undefined,
       tp || undefined,
       {
-        comment: "forex-algo"
+        comment,
+        clientId
       }
     );
 
@@ -48,7 +49,8 @@ export async function placeOrder({ symbol, type, volume, sl, tp }) {
       sl || undefined,
       tp || undefined,
       {
-        comment: "forex-algo"
+        comment,
+        clientId
       }
     );
 
@@ -59,8 +61,13 @@ export async function placeOrder({ symbol, type, volume, sl, tp }) {
 
   return {
     success: true,
-    orderId: result.orderId
+    orderId: result.orderId,
+    positionId: result.positionId
   };
+}
+
+export async function getSymbolSpecification(symbol) {
+  return getConnection().getSymbolSpecification(symbol);
 }
 
 export async function getPositions() {
@@ -76,12 +83,24 @@ export async function getPositions() {
     sl          : p.stopLoss,
     tp          : p.takeProfit,
     openTime    : p.time,
+    magic       : p.magic,
+    comment     : p.comment,
+    clientId    : p.clientId,
   }));
 }
 
 export async function closePosition(positionId) {
   await getConnection().closePosition(positionId);
   return { success: true };
+}
+
+export async function closePositionPartially(positionId, volume, comment = "forex-algo") {
+  const result = await getConnection().closePositionPartially(positionId, volume, { comment });
+  return {
+    success: true,
+    orderId: result.orderId,
+    positionId: result.positionId
+  };
 }
 
 export async function closeAllPositions() {
