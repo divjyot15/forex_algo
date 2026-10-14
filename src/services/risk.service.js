@@ -6,7 +6,7 @@ const RULES = {
   maxDailyLossPercent: 4.5,
   maxTotalDrawdown: 9,
   maxPositions: 5,
-  maxLotSize: 1.0
+  maxLotSize: 2.0
 };
 
 const stateFile = path.resolve(process.env.RISK_STATE_FILE || "data/risk-state.json");

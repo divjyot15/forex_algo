@@ -44,59 +44,69 @@ export function getAccount() {
 // INIT STREAMING CONNECTION
 // =============================================================================
 
-export async function initStreamingConnection() {
+export async function initStreamingConnection(listener) {
+  if (!account) {
+    throw new Error("MT5 not connected yet.");
+  }
 
-    if (!account) {
-
-        throw new Error(
-            "MT5 not connected yet."
-        );
-    }
-
-    if (streamingConnection) {
-
-        return streamingConnection;
-    }
-
-    console.log(
-        "⏳ Creating MT5 streaming connection..."
-    );
-
-    streamingConnection =
-        account.getStreamingConnection();
-
-    await streamingConnection.connect();
-
-    console.log(
-        "✅ Streaming connection connected"
-    );
-
-    console.log(
-        "⏳ Waiting for streaming synchronization..."
-    );
-
-    await streamingConnection.waitSynchronized();
-
-    console.log(
-        "✅ Streaming connection synchronized"
-    );
-
+  if (streamingConnection) {
     return streamingConnection;
+  }
+
+  console.log("⏳ Creating MT5 streaming connection...");
+
+  const newConnection = account.getStreamingConnection();
+  streamingConnection = newConnection;
+
+  try {
+    // Register before connecting and synchronizing.
+    if (listener) {
+      newConnection.addSynchronizationListener(listener);
+    }
+
+    await newConnection.connect();
+    console.log("✅ Streaming connection connected");
+
+    await newConnection.waitSynchronized();
+    console.log("✅ Streaming connection synchronized");
+
+    return newConnection;
+  } catch (error) {
+    if (streamingConnection === newConnection) {
+      streamingConnection = null;
+    }
+
+    try {
+      await newConnection.close();
+    } catch (closeError) {
+      console.error(
+        "⚠️ Failed connection cleanup:",
+        closeError.message
+      );
+    }
+
+    throw error;
+  }
 }
 
-
-// =============================================================================
-// GET STREAMING CONNECTION
-// =============================================================================
-
 export function getStreamingConnection() {
+  if (!streamingConnection) {
+    throw new Error(
+      "MT5 streaming connection not initialized yet."
+    );
+  }
 
-    if (!streamingConnection) {
+  return streamingConnection;
+}
 
-        throw new Error(
-            "MT5 streaming connection not initialized yet."
-        );
-    }
+export async function closeStreamingConnection() {
+  const current = streamingConnection;
 
-    return streamingConnection;
+  // Clear the shared reference even if closing fails.
+  streamingConnection = null;
+
+  if (current) {
+    await current.close();
+    console.log("🔌 Streaming connection closed");
+  }
 }

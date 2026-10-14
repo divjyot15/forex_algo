@@ -11,7 +11,7 @@ import { canTrade } from "./risk.service.js";
 import { sendDiscord } from "./discord.service.js";
 
 const SYMBOL = process.env.METAAPI_SYMBOL || "XAUUSD";
-const STRATEGY_COMMENT = "strat";
+const STRATEGY_COMMENT = "Forex-Algo-Live-Strategy";
 
 function notifyDiscord(message) {
   void sendDiscord(message);
@@ -155,8 +155,7 @@ export class LiveTradeManager {
         volume,
         sl: stopLoss,
         tp: target2,
-        comment: STRATEGY_COMMENT,
-        clientId
+        comment: STRATEGY_COMMENT
       });
     } catch (error) {
       notifyDiscord(`**${direction} order failed: ${this.symbol}**\nVolume: ${volume}\nError: ${error.message}`);
