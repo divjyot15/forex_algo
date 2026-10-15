@@ -1,4 +1,5 @@
 
+import "dotenv/config";
 import pkg from "metaapi.cloud-sdk/node";
 
 import {
@@ -10,11 +11,11 @@ const { SynchronizationListener } = pkg;
 
 const SYMBOL = process.env.METAAPI_SYMBOL || "XAUUSD";
 
-// Adjust these for your broker and operating hours.
-const NO_TICK_TIMEOUT_MS = 120_000;  // 2 minutes
-const WATCHDOG_INTERVAL_MS = 15_000; // Check every 15 seconds
-const RESUBSCRIBE_WAIT_MS = 30_000;  // Wait after resubscription
-const RECOVERY_COOLDOWN_MS = 300_000; // 5 minutes
+const NO_TICK_TIMEOUT_MS = 120_000;
+const WATCHDOG_INTERVAL_MS = 15_000;
+const RESUBSCRIBE_WAIT_MS = 30_000;
+const RECOVERY_COOLDOWN_MS = 300_000;
+const TICK_LOG_INTERVAL_MS = 30_000;
 
 let streamingConnection = null;
 let tickHandler = null;
@@ -24,9 +25,17 @@ let starting = false;
 let recovering = false;
 
 let watchdogTimer = null;
+
+// Only processPrice() updates lastTickAt.
 let lastTickAt = 0;
+
+// Time at which the current subscription was established.
+// This is not proof that a tick was received.
+let subscriptionStartedAt = 0;
+
 let lastRecoveryAt = 0;
 let lastPriceKey = null;
+let lastTickLogAt = 0;
 
 const sleep = (ms) =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -36,8 +45,8 @@ function processPrice(price) {
     return;
   }
 
-  // Avoid processing the same update through both callbacks.
-  // If no timestamp is available, don't deduplicate by price alone.
+  // Avoid duplicate delivery through single-price and
+  // batch-price callbacks.
   const timestamp =
     price.time ?? price.brokerTime ?? price.timeMsc;
 
@@ -56,9 +65,23 @@ function processPrice(price) {
     lastPriceKey = key;
   }
 
-  // Record delivery before invoking strategy code.
-  lastTickAt = Date.now();
+  const now = Date.now();
+
+  // A genuine price callback is the only thing that
+  // proves market-data delivery has resumed.
+  lastTickAt = now;
   lastRecoveryAt = 0;
+
+  // Avoid printing every tick and filling PM2 logs.
+  if (now - lastTickLogAt >= TICK_LOG_INTERVAL_MS) {
+    console.log(`📈 ${SYMBOL} tick received`, {
+      bid: price.bid,
+      ask: price.ask,
+      time: timestamp ?? "unavailable"
+    });
+
+    lastTickLogAt = now;
+  }
 
   if (typeof tickHandler !== "function") {
     return;
@@ -71,7 +94,10 @@ function processPrice(price) {
 
 class TickSynchronizationListener extends SynchronizationListener {
   async onConnected(instanceIndex, replicas) {
-    console.log("🔗 MetaApi stream connected:", instanceIndex);
+    console.log(
+      "🔗 MetaApi stream connected:",
+      instanceIndex
+    );
   }
 
   async onDisconnected(instanceIndex) {
@@ -113,11 +139,7 @@ class TickSynchronizationListener extends SynchronizationListener {
     processPrice(price);
   }
 
-  async onSymbolPricesUpdated(
-    instanceIndex,
-    prices
-  ) {
-    // Do not discard batch updates.
+  async onSymbolPricesUpdated(instanceIndex, prices) {
     const list = Array.isArray(prices)
       ? prices
       : prices && typeof prices === "object"
@@ -150,7 +172,9 @@ export async function startTickStream() {
   }
 
   if (starting) {
-    console.log("⚠️ Tick stream startup already in progress.");
+    console.log(
+      "⚠️ Tick stream startup already in progress."
+    );
     return;
   }
 
@@ -163,7 +187,6 @@ export async function startTickStream() {
   starting = true;
 
   try {
-    // Listener is registered before connect/synchronization.
     streamingConnection = await initStreamingConnection(
       synchronizationListener
     );
@@ -172,9 +195,12 @@ export async function startTickStream() {
 
     await streamingConnection.subscribeToMarketData(SYMBOL);
 
-    lastTickAt = Date.now();
+    // Do not set lastTickAt here. A subscription resolving
+    // does not prove that a price has been delivered.
+    subscriptionStartedAt = Date.now();
     lastPriceKey = null;
     lastRecoveryAt = 0;
+    lastTickLogAt = 0;
 
     started = true;
 
@@ -185,9 +211,14 @@ export async function startTickStream() {
     }, WATCHDOG_INTERVAL_MS);
 
     console.log(`✅ Subscribed to ${SYMBOL}`);
-    console.log("🟢 Live tick stream running...");
+    console.log(
+      "🟢 Live tick stream running; waiting for actual prices..."
+    );
   } catch (error) {
-    console.error("❌ Tick stream startup failed:", error);
+    console.error(
+      "❌ Tick stream startup failed:",
+      error
+    );
 
     started = false;
     streamingConnection = null;
@@ -213,21 +244,31 @@ export async function startTickStream() {
 }
 
 async function checkTickHealth() {
-  if (!started || recovering || !streamingConnection) {
+  if (
+    !started ||
+    starting ||
+    recovering ||
+    !streamingConnection
+  ) {
     return;
   }
 
-  const silence = Date.now() - lastTickAt;
+  // Use the subscription start only until the first tick.
+  // Afterwards, measure silence from the actual last tick.
+  const healthBaseline = Math.max(
+    lastTickAt,
+    subscriptionStartedAt
+  );
+
+  const silence = Date.now() - healthBaseline;
 
   if (silence < NO_TICK_TIMEOUT_MS) {
     return;
   }
 
-  // Prevent repeated reconnection attempts during a quiet
-  // market or while the broker is unavailable.
   if (
-    Date.now() - lastRecoveryAt <
-    RECOVERY_COOLDOWN_MS
+    lastRecoveryAt &&
+    Date.now() - lastRecoveryAt < RECOVERY_COOLDOWN_MS
   ) {
     return;
   }
@@ -252,31 +293,46 @@ async function recoverTickStream() {
   try {
     const current = streamingConnection;
 
+    // Attempt 1: refresh the subscription on the current
+    // connection.
     if (current) {
-      // First attempt: restore the market-data subscription.
       try {
         console.log(`🔄 Resubscribing to ${SYMBOL}...`);
 
         await current.unsubscribeFromMarketData(SYMBOL);
+
+        if (!started) {
+          return;
+        }
+
         await current.subscribeToMarketData(SYMBOL);
 
         const recoveryStartedAt = Date.now();
 
+        subscriptionStartedAt = recoveryStartedAt;
+
         console.log(
-          `⏳ Waiting for fresh ${SYMBOL} ticks...`
+          `⏳ Waiting up to ${
+            RESUBSCRIBE_WAIT_MS / 1000
+          } seconds for fresh ${SYMBOL} ticks...`
         );
 
         await sleep(RESUBSCRIBE_WAIT_MS);
+
+        if (!started) {
+          return;
+        }
 
         if (lastTickAt >= recoveryStartedAt) {
           console.log(
             `✅ ${SYMBOL} ticks resumed after resubscription`
           );
+
           return;
         }
 
         console.warn(
-          "⚠️ Resubscription did not restore ticks."
+          `⚠️ No fresh ${SYMBOL} tick after resubscription.`
         );
       } catch (error) {
         console.error(
@@ -286,7 +342,12 @@ async function recoverTickStream() {
       }
     }
 
-    // Second attempt: recreate the streaming connection.
+    // Attempt 2: close the shared connection and create a
+    // genuinely new connection.
+    if (!started) {
+      return;
+    }
+
     console.warn("🔄 Rebuilding streaming connection...");
 
     streamingConnection = null;
@@ -308,15 +369,21 @@ async function recoverTickStream() {
       synchronizationListener
     );
 
+    if (!started) {
+      await closeStreamingConnection();
+      streamingConnection = null;
+      return;
+    }
+
     await streamingConnection.subscribeToMarketData(SYMBOL);
 
-    // Allow the watchdog to detect continued silence from
-    // this new subscription.
-    lastTickAt = Date.now();
+    // Reset the subscription baseline, not the last actual
+    // tick timestamp.
+    subscriptionStartedAt = Date.now();
     lastPriceKey = null;
 
     console.log(
-      `✅ Reconnected and subscribed to ${SYMBOL}; waiting for ticks`
+      `✅ Reconnected and subscribed to ${SYMBOL}; waiting for actual ticks`
     );
   } catch (error) {
     console.error(
@@ -358,6 +425,11 @@ export async function stopTickStream() {
   }
 
   streamingConnection = null;
+  subscriptionStartedAt = 0;
+  lastTickAt = 0;
+  lastPriceKey = null;
+  lastRecoveryAt = 0;
+  lastTickLogAt = 0;
 
   try {
     await closeStreamingConnection();
