@@ -44,6 +44,17 @@ export class LiveStrategyService {
     notifyDiscord(`**Strategy ready**\nSymbol: ${this.symbol}\nOrder execution: ${this.tradeManager.tradingEnabled ? "ENABLED" : "DISABLED"}`);
   }
 
+  _syncActiveParent() {
+  const activeParent =
+    this.market.obManager.orderBlocks.find(
+      ob => ob.status === "active"
+    ) ?? null;
+
+  this.watcher.setActiveParent(activeParent);
+
+  return activeParent;
+}
+
   handleClosedCandle(timeframe, candle) {
     const work = this.processing.then(async () => {
       if (!this.initialized) throw new Error("Live strategy received a candle before initialization completed.");
@@ -117,7 +128,7 @@ export class LiveStrategyService {
       this.watcher.invalidateZonesForParent(alert.ob.id);
     }
 
-    const activeParent = this.market.obManager.orderBlocks.find(ob => ob.status === "active");
+    const activeParent = this._syncActiveParent();    
     if (!activeParent) return;
     activeParent.overlapping5mOBs = this.fvg5m.confirmed.filter(fvg =>
       fvg.obType === activeParent.obType &&
@@ -161,6 +172,7 @@ export class LiveStrategyService {
       }
     }
 
+    this._syncActiveParent();
     const hadOpenTrade = Boolean(this.tradeManager.openTrade);
     const alerts = this.watcher.onCandle(normalized);
     if (live) {
