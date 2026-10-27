@@ -51,8 +51,15 @@ export class LiveTradeManager {
     this.tp2Pips = tp2Pips;
     this.maxLots = maxLots;
     this.tradingEnabled = process.env.LIVE_STRATEGY_TRADING_ENABLED === "true";
+    this.entriesEnabled = true;
+    this.entryGateReason = null;
     this.specification = null;
     this.openTrade = null;
+  }
+
+  setEntriesEnabled(enabled, reason = null) {
+    this.entriesEnabled = Boolean(enabled);
+    this.entryGateReason = this.entriesEnabled ? null : reason;
   }
 
   async initialize() {
@@ -80,6 +87,11 @@ export class LiveTradeManager {
     if (!this.tradingEnabled) {
       console.info("[strategy] Signal observed only; set LIVE_STRATEGY_TRADING_ENABLED=true to place orders.");
       notifyDiscord(`**Order not placed**\n${direction} signal is observation-only because live trading is disabled.`);
+      return null;
+    }
+    if (!this.entriesEnabled) {
+      console.warn(`[strategy] Signal blocked while entry gate is closed: ${this.entryGateReason ?? "system safety gate"}.`);
+      notifyDiscord(`**Order blocked by safety gate**\n${this.entryGateReason ?? "System safety gate is active."}`);
       return null;
     }
     if (this.openTrade) {

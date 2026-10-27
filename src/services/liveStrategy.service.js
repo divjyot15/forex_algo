@@ -3,11 +3,19 @@ import { FVGTracker, MarketStructureEngine, zonesOverlap } from "../strategy/mar
 import { FiveMinuteEntryWatcher } from "../strategy/fiveMinuteEntryWatcher.js";
 import { sendDiscord } from "./discord.service.js";
 import { LiveTradeManager } from "./liveTradeManager.service.js";
+import {
+  brokerTimestamp,
+  completedBucketRange,
+  sortCandleEvents,
+  timeframeMilliseconds,
+  validateHistoricalCoverage
+} from "./candleReconciliation.js";
 
 const SYMBOL = process.env.METAAPI_SYMBOL || "XAUUSD";
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
 const CANDLE_FINALIZATION_DELAY_MS = 3000;
+const RECOVERY_AUDIT_CANDLE_LIMIT = 20;
 
 function candleCloseTime(candle, timeframe) {
   const openTime = new Date(candle.time).getTime();
@@ -18,12 +26,24 @@ function notifyDiscord(message) {
   void sendDiscord(message);
 }
 
+function logCandleAudit(title, candles) {
+  console.info(`[recovery] ${title} (${candles.length} candle(s))`);
+  for (const candle of candles) {
+    console.info(
+      `[recovery] ${candle.brokerTime ?? candle.time} ` +
+      `O:${candle.open} H:${candle.high} L:${candle.low} C:${candle.close}`
+    );
+  }
+}
+
 export class LiveStrategyService {
   constructor({
     symbol = SYMBOL,
     zigzagLength = Number(process.env.STRATEGY_ZIGZAG_LENGTH || 5),
     warmupLimit = Number(process.env.STRATEGY_WARMUP_CANDLES || 1000),
-    tradeManager = new LiveTradeManager({ symbol })
+    tradeManager = new LiveTradeManager({ symbol }),
+    historicalCandleFetcher = (requestedSymbol, timeframe, startTime, limit) =>
+      getAccount().getHistoricalCandles(requestedSymbol, timeframe, startTime, limit)
   } = {}) {
     this.symbol = symbol;
     this.warmupLimit = Math.min(1000, Math.max(100, warmupLimit));
@@ -31,9 +51,14 @@ export class LiveStrategyService {
     this.fvg5m = new FVGTracker();
     this.watcher = new FiveMinuteEntryWatcher();
     this.tradeManager = tradeManager;
+    this.historicalCandleFetcher = historicalCandleFetcher;
     this.fiveMinuteIndex = -1;
     this.initialized = false;
     this.processing = Promise.resolve();
+    this.reconciliationPending = false;
+    this.candleJournal = [];
+    this.journalKeys = new Set();
+    this.startupInitialBuckets = { M5: null, M15: null };
   }
 
   async initialize() {
@@ -55,13 +80,143 @@ export class LiveStrategyService {
   return activeParent;
 }
 
+  beginRecovery() {
+    const wasPending = this.reconciliationPending;
+    this.reconciliationPending = true;
+    this.tradeManager.setEntriesEnabled?.(false, "stream recovery pending");
+    if (!wasPending) console.warn("[strategy] New entries disabled until candle recovery is reconciled.");
+  }
+
+  setStartupInitialBuckets(initialBuckets) {
+    this.startupInitialBuckets = { ...this.startupInitialBuckets, ...initialBuckets };
+  }
+
+  reconcileRecovery({ lastBrokerTimestamp, resumeTimestamp, startupInitialBuckets = this.startupInitialBuckets }) {
+    this.beginRecovery();
+    const work = this.processing.then(() =>
+      this._reconcileRecovery(lastBrokerTimestamp, resumeTimestamp, startupInitialBuckets)
+    );
+    this.processing = work.catch(error => {
+      console.error("[strategy] Historical candle reconciliation failed; entries remain disabled:", error);
+    });
+    return work;
+  }
+
+  async _reconcileRecovery(lastBrokerTimestamp, resumeTimestamp, startupInitialBuckets) {
+    if (!this.initialized) throw new Error("Cannot reconcile before strategy initialization.");
+    if (!Number.isFinite(resumeTimestamp)) {
+      throw new Error("Recovery is missing a valid resumed broker timestamp.");
+    }
+    if (lastBrokerTimestamp == null && this.candleJournal.length === 0) {
+      this.reconciliationPending = false;
+      this.tradeManager.setEntriesEnabled?.(true);
+      return { lastBrokerTimestamp: resumeTimestamp, resumeTimestamp, repairedThrough: {} };
+    }
+    if (!Number.isFinite(lastBrokerTimestamp) || resumeTimestamp < lastBrokerTimestamp) {
+      throw new Error("Recovery is missing a valid, ordered broker timestamp interval.");
+    }
+
+    const repaired = [];
+    const repairedThrough = {};
+    for (const [timeframe, apiTimeframe] of [["M5", "5m"], ["M15", "15m"]]) {
+      const range = completedBucketRange(lastBrokerTimestamp, resumeTimestamp, timeframe);
+      const expected = range.expected.filter(timestamp => timestamp !== startupInitialBuckets?.[timeframe]);
+      if (!expected.length) continue;
+      if (expected.length > 995) {
+        throw new Error(`${timeframe} recovery interval exceeds the 1000-candle MetaApi request limit.`);
+      }
+
+      const latestCandleOpen = expected.at(-1);
+      const requestLimit = Math.min(1000, expected.length + 5);
+      const raw = await this.historicalCandleFetcher(
+        this.symbol,
+        apiTimeframe,
+        new Date(latestCandleOpen + timeframeMilliseconds(timeframe)),
+        requestLimit
+      );
+      const verified = validateHistoricalCoverage(raw, timeframe, this.symbol, expected);
+      repaired.push(...verified.map(candle => ({ timeframe, candle })));
+      repairedThrough[timeframe] = latestCandleOpen;
+    }
+
+    if (!repaired.length) {
+      this.reconciliationPending = false;
+      this.tradeManager.setEntriesEnabled?.(true);
+      console.info("[strategy] Recovery contained no completed M5/M15 buckets; affected partial candles will be discarded.");
+      return { lastBrokerTimestamp, resumeTimestamp, repairedThrough };
+    }
+
+    console.info(`[recovery] Verified historical candles for ${this.symbol}:`);
+    for (const timeframe of ["M5", "M15"]) {
+      const timeframeCandles = sortCandleEvents(repaired)
+        .filter(event => event.timeframe === timeframe)
+        .map(event => event.candle);
+      if (timeframeCandles.length) {
+        logCandleAudit(`Recovered ${timeframe} bars`, timeframeCandles);
+      }
+    }
+
+    const repairedByKey = new Map(repaired.map(event => [
+      `${event.timeframe}:${event.candle.timestamp}`,
+      event
+    ]));
+    const merged = new Map();
+    for (const event of this.candleJournal) {
+      const timestamp = event.candle.timestamp ?? brokerTimestamp(event.candle.time);
+      if (!Number.isFinite(timestamp)) throw new Error(`Invalid timestamp in strategy journal: ${event.candle.time}`);
+      const key = `${event.timeframe}:${timestamp}`;
+      merged.set(key, repairedByKey.get(key) ?? {
+        timeframe: event.timeframe,
+        candle: { ...event.candle, timestamp }
+      });
+    }
+    for (const [key, event] of repairedByKey) merged.set(key, event);
+
+    const replay = sortCandleEvents([...merged.values()]);
+    this.candleJournal = replay.map(event => ({
+      timeframe: event.timeframe,
+      candle: { ...event.candle }
+    }));
+    this.journalKeys = new Set(this.candleJournal.map(event =>
+      `${event.timeframe}:${event.candle.timestamp}`
+    ));
+
+    this.market = new MarketStructureEngine({ zigzagLength: this.market.zigzag.length });
+    this.fvg5m = new FVGTracker();
+    this.watcher = new FiveMinuteEntryWatcher();
+    this.fiveMinuteIndex = -1;
+    for (const event of replay) {
+      if (event.timeframe === "M5") await this._processM5(event.candle, false);
+      else this._processM15(event.candle, false);
+    }
+
+    for (const timeframe of ["M5", "M15"]) {
+      const latestCandles = this.candleJournal
+        .filter(event => event.timeframe === timeframe)
+        .slice(-RECOVERY_AUDIT_CANDLE_LIMIT)
+        .map(event => event.candle);
+      logCandleAudit(`Latest ${timeframe} candles after recovery`, latestCandles);
+    }
+
+    this.reconciliationPending = false;
+    this.tradeManager.setEntriesEnabled?.(true);
+    console.info(`[strategy] Reconciled ${repaired.length} authoritative candles and replayed ${replay.length} candles without trade execution.`);
+    return { lastBrokerTimestamp, resumeTimestamp, repairedThrough };
+  }
+
   handleClosedCandle(timeframe, candle) {
     const work = this.processing.then(async () => {
       if (!this.initialized) throw new Error("Live strategy received a candle before initialization completed.");
       if (timeframe !== "M5" && timeframe !== "M15") return;
       if (candle.symbol && candle.symbol !== this.symbol) return;
+      if (this.reconciliationPending) throw new Error("Refusing to process a live candle while recovery reconciliation is pending.");
+      const timestamp = candle.timestamp ?? brokerTimestamp(candle.time);
+      const journalKey = `${timeframe}:${timestamp}`;
+      if (!Number.isFinite(timestamp) || this.journalKeys.has(journalKey)) return;
       if (timeframe === "M5") await this._processM5(candle, true);
       else this._processM15(candle, true);
+      this.journalKeys.add(journalKey);
+      this.candleJournal.push({ timeframe, candle: { ...candle, timestamp } });
     });
     this.processing = work.catch(error => {
       console.error(`[strategy] Failed processing ${timeframe} candle ${candle?.time}:`, error);

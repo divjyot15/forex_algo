@@ -79,6 +79,14 @@ const initialBuckets = {
 
 };
 
+const startupInitialBuckets = {
+
+    M5: null,
+
+    M15: null
+
+};
+
 
 // =============================================================================
 // FIRST TICK
@@ -117,6 +125,9 @@ const lastClosedTimestamp = {
 
 const processedTicks =
     new Set();
+
+let recoveryPending = false;
+let tickProcessing = Promise.resolve();
 
 
 // =============================================================================
@@ -406,12 +417,16 @@ function initializeFirstBuckets(
             TIMEFRAMES.M5
         );
 
+    startupInitialBuckets.M5 = initialBuckets.M5;
+
 
     initialBuckets.M15 =
         getCandleBucket(
             timestamp,
             TIMEFRAMES.M15
         );
+
+    startupInitialBuckets.M15 = initialBuckets.M15;
 
 
     console.log(
@@ -696,6 +711,17 @@ export async function handleTick(
     price
 ) {
 
+    const work = tickProcessing.then(() => processTick(price));
+    tickProcessing = work.catch(error => {
+        console.error("❌ Candle builder tick processing failed:", error);
+    });
+    return work;
+}
+
+async function processTick(
+    price
+) {
+
     if (!price) {
 
         return;
@@ -710,6 +736,10 @@ export async function handleTick(
 
         return;
 
+    }
+
+    if (recoveryPending) {
+        return;
     }
 
 
@@ -887,26 +917,24 @@ async function closeCompletedCandles() {
         CANDLE_DELAY_MS;
 
 
-    await closeTimeframeCandles(
+    const ready = [];
+    for (const timeframeName of ["M5", "M15"]) {
+        const timeframeMs = TIMEFRAMES[timeframeName] * 60 * 1000;
+        for (const timestamp of candles[timeframeName].keys()) {
+            if (timestamp + timeframeMs <= cutoff) {
+                ready.push({ timeframeName, timestamp, closeTime: timestamp + timeframeMs });
+            }
+        }
+    }
 
-        "M5",
-
-        TIMEFRAMES.M5,
-
-        cutoff
-
+    ready.sort((left, right) =>
+        left.closeTime - right.closeTime ||
+        (left.timeframeName === "M5" ? -1 : 1)
     );
 
-
-    await closeTimeframeCandles(
-
-        "M15",
-
-        TIMEFRAMES.M15,
-
-        cutoff
-
-    );
+    for (const item of ready) {
+        await closeCandle(item.timeframeName, item.timestamp);
+    }
 
 }
 
@@ -915,156 +943,52 @@ async function closeCompletedCandles() {
 // CLOSE TIMEFRAME CANDLES
 // =============================================================================
 
-async function closeTimeframeCandles(
+async function closeCandle(timeframeName, timestamp) {
+    const timeframeCandles = candles[timeframeName];
+    const candle = timeframeCandles.get(timestamp);
+    if (!candle) return;
 
-    timeframeName,
+    timeframeCandles.delete(timestamp);
 
-    timeframeMinutes,
-
-    cutoff
-
-) {
-
-    const timeframeCandles =
-        candles[
-            timeframeName
-        ];
-
-
-    const timeframeMs =
-        timeframeMinutes *
-        60 *
-        1000;
-
-
-    const timestamps =
-        [
-            ...timeframeCandles.keys()
-        ]
-        .sort(
-            (a, b) => a - b
-        );
-
-
-    for (
-        const timestamp
-        of timestamps
-    ) {
-
-        const candleEnd =
-            timestamp +
-            timeframeMs;
-
-
-        // =====================================================================
-        // NOT FINISHED
-        // =====================================================================
-
-        if (
-            candleEnd >
-            cutoff
-        ) {
-
-            continue;
-
-        }
-
-
-        const candle =
-            timeframeCandles.get(
-                timestamp
-            );
-
-
-        if (!candle) {
-
-            continue;
-
-        }
-
-
-        timeframeCandles.delete(
-            timestamp
-        );
-
-
-        // =====================================================================
-        // INITIAL PARTIAL CANDLE
-        // =====================================================================
-
-        if (
-            timestamp ===
-            initialBuckets[
-                timeframeName
-            ]
-        ) {
-
-            console.log(
-                `⚠️ Ignoring initial partial ${timeframeName} candle:`,
-                formatBrokerTime(
-                    timestamp
-                )
-            );
-
-
-            lastClosedTimestamp[
-                timeframeName
-            ] =
-                timestamp;
-
-
-            continue;
-
-        }
-
-
-        // =====================================================================
-        // VALID COMPLETED CANDLE
-        // =====================================================================
-
-        lastClosedTimestamp[
-            timeframeName
-        ] =
-            timestamp;
-
-
-        console.log(
-            `\n🕯️ ${timeframeName} CLOSED`
-        );
-
-
-        console.log(
-            `Time: ${candle.brokerTime}`
-        );
-
-
-        console.log(
-            `O: ${candle.open} ` +
-            `H: ${candle.high} ` +
-            `L: ${candle.low} ` +
-            `C: ${candle.close}`
-        );
-
-
-        console.log(
-            `Ticks: ${candle.tickCount}`
-        );
-
-
-        // =====================================================================
-        // SEND TO LIVE ALGO
-        // =====================================================================
-
-        await emitCandle(
-
-            timeframeName,
-
-            candle
-
-        );
-
+    if (timestamp === initialBuckets[timeframeName]) {
+        console.log(`⚠️ Ignoring initial partial ${timeframeName} candle:`, formatBrokerTime(timestamp));
+        lastClosedTimestamp[timeframeName] = timestamp;
+        return;
     }
 
+    lastClosedTimestamp[timeframeName] = timestamp;
+    console.log(`\n🕯️ ${timeframeName} CLOSED`);
+    console.log(`Time: ${candle.brokerTime}`);
+    console.log(`O: ${candle.open} H: ${candle.high} L: ${candle.low} C: ${candle.close}`);
+    console.log(`Ticks: ${candle.tickCount}`);
+    await emitCandle(timeframeName, candle);
+}
+
+export function beginCandleRecovery() {
+    recoveryPending = true;
+    return { ...startupInitialBuckets };
+}
+
+export async function completeCandleRecovery({ fromTimestamp, resumeTimestamp, repairedThrough }) {
+    if (!Number.isFinite(fromTimestamp) || !Number.isFinite(resumeTimestamp)) {
+        throw new Error("Candle recovery requires valid broker timestamps.");
+    }
+
+    await tickProcessing;
+    for (const timeframeName of ["M5", "M15"]) {
+        for (const timestamp of candles[timeframeName].keys()) {
+            if (timestamp >= Math.floor(fromTimestamp / (TIMEFRAMES[timeframeName] * 60_000)) * TIMEFRAMES[timeframeName] * 60_000) {
+                candles[timeframeName].delete(timestamp);
+            }
+        }
+        const repairedTimestamp = repairedThrough[timeframeName];
+        if (Number.isFinite(repairedTimestamp)) {
+            lastClosedTimestamp[timeframeName] = Math.max(lastClosedTimestamp[timeframeName] ?? -Infinity, repairedTimestamp);
+        }
+        initialBuckets[timeframeName] = getCandleBucket(resumeTimestamp, TIMEFRAMES[timeframeName]);
+    }
+
+    recoveryPending = false;
 }
 
 
@@ -1111,6 +1035,10 @@ export function getCurrentCandle(
         timestamps[0]
     );
 
+}
+
+export function getStartupInitialBuckets() {
+    return { ...startupInitialBuckets };
 }
 
 
