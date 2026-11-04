@@ -22,6 +22,11 @@ export function brokerTimestamp(value) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+export function isNewerBrokerTimestamp(timestamp, previousTimestamp) {
+  return Number.isFinite(timestamp) &&
+    (previousTimestamp == null || timestamp > previousTimestamp);
+}
+
 export function timeframeMilliseconds(timeframe) {
   const minutes = TIMEFRAME_MINUTES[timeframe];
   if (!minutes) throw new Error(`Unsupported timeframe: ${timeframe}`);

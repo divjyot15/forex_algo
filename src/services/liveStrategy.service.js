@@ -36,6 +36,17 @@ function logCandleAudit(title, candles) {
   }
 }
 
+function logProcessedCandleAudit(timeframe, records) {
+  console.info(`[recovery] Processed ${timeframe} reconciliation audit (${records.length} record(s))`);
+  for (const record of records) {
+    const candle = record.candle;
+    console.info(
+      `[recovery] source=${record.source} ${candle.brokerTime ?? candle.time} ` +
+      `O:${candle.open} H:${candle.high} L:${candle.low} C:${candle.close}`
+    );
+  }
+}
+
 export class LiveStrategyService {
   constructor({
     symbol = SYMBOL,
@@ -58,6 +69,7 @@ export class LiveStrategyService {
     this.reconciliationPending = false;
     this.candleJournal = [];
     this.journalKeys = new Set();
+    this.processedCandleSet = new Map();
     this.startupInitialBuckets = { M5: null, M15: null };
   }
 
@@ -156,10 +168,14 @@ export class LiveStrategyService {
       }
     }
 
-    const repairedByKey = new Map(repaired.map(event => [
-      `${event.timeframe}:${event.candle.timestamp}`,
-      event
-    ]));
+    const repairedByKey = new Map(repaired.map(event => {
+      const key = `${event.timeframe}:${event.candle.timestamp}`;
+      return [key, {
+        timeframe: event.timeframe,
+        source: "historical",
+        candle: { ...event.candle }
+      }];
+    }));
     const merged = new Map();
     for (const event of this.candleJournal) {
       const timestamp = event.candle.timestamp ?? brokerTimestamp(event.candle.time);
@@ -167,6 +183,7 @@ export class LiveStrategyService {
       const key = `${event.timeframe}:${timestamp}`;
       merged.set(key, repairedByKey.get(key) ?? {
         timeframe: event.timeframe,
+        source: event.source ?? "tick",
         candle: { ...event.candle, timestamp }
       });
     }
@@ -175,19 +192,19 @@ export class LiveStrategyService {
     const replay = sortCandleEvents([...merged.values()]);
     this.candleJournal = replay.map(event => ({
       timeframe: event.timeframe,
+      source: event.source ?? "tick",
       candle: { ...event.candle }
     }));
     this.journalKeys = new Set(this.candleJournal.map(event =>
       `${event.timeframe}:${event.candle.timestamp}`
     ));
-
     this.market = new MarketStructureEngine({ zigzagLength: this.market.zigzag.length });
     this.fvg5m = new FVGTracker();
     this.watcher = new FiveMinuteEntryWatcher();
     this.fiveMinuteIndex = -1;
     for (const event of replay) {
-      if (event.timeframe === "M5") await this._processM5(event.candle, false);
-      else this._processM15(event.candle, false);
+      if (event.timeframe === "M5") await this._processM5(event.candle, false, event.source ?? "tick");
+      else this._processM15(event.candle, false, event.source ?? "tick");
     }
 
     for (const timeframe of ["M5", "M15"]) {
@@ -196,6 +213,10 @@ export class LiveStrategyService {
         .slice(-RECOVERY_AUDIT_CANDLE_LIMIT)
         .map(event => event.candle);
       logCandleAudit(`Latest ${timeframe} candles after recovery`, latestCandles);
+    }
+
+    for (const timeframe of ["M5", "M15"]) {
+      logProcessedCandleAudit(timeframe, this.getProcessedCandles(timeframe));
     }
 
     this.reconciliationPending = false;
@@ -213,15 +234,32 @@ export class LiveStrategyService {
       const timestamp = candle.timestamp ?? brokerTimestamp(candle.time);
       const journalKey = `${timeframe}:${timestamp}`;
       if (!Number.isFinite(timestamp) || this.journalKeys.has(journalKey)) return;
-      if (timeframe === "M5") await this._processM5(candle, true);
-      else this._processM15(candle, true);
+      if (timeframe === "M5") await this._processM5(candle, true, "tick");
+      else this._processM15(candle, true, "tick");
+      const record = {
+        timeframe,
+        source: "tick",
+        candle: { ...candle, timestamp }
+      };
       this.journalKeys.add(journalKey);
-      this.candleJournal.push({ timeframe, candle: { ...candle, timestamp } });
+      this.candleJournal.push(record);
     });
     this.processing = work.catch(error => {
       console.error(`[strategy] Failed processing ${timeframe} candle ${candle?.time}:`, error);
     });
     return work;
+  }
+
+  getProcessedCandles(timeframe = null) {
+    return [...this.processedCandleSet.values()]
+      .filter(record => !timeframe || record.timeframe === timeframe)
+      .sort((left, right) => {
+        const leftTimestamp = left.candle.timestamp ?? brokerTimestamp(left.candle.time);
+        const rightTimestamp = right.candle.timestamp ?? brokerTimestamp(right.candle.time);
+        return leftTimestamp - rightTimestamp ||
+          (left.timeframe === right.timeframe ? left.source.localeCompare(right.source) : left.timeframe === "M5" ? -1 : 1);
+      })
+      .map(record => ({ ...record, candle: { ...record.candle } }));
   }
 
 //   async _warmup() {
@@ -257,9 +295,10 @@ export class LiveStrategyService {
 //     console.info(`[strategy] Warmed up from ${history.filter(event => event.timeframe === "M15").length} completed M15 and ${history.filter(event => event.timeframe === "M5").length} completed M5 candles; historical signals were not traded.`);
 //   }
 
-  _processM15(candle, live) {
+  _processM15(candle, live, source = "tick") {
     const previousObCount = this.market.obManager.orderBlocks.length;
     const result = this.market.onCandle(candle);
+    this._recordProcessedCandle("M15", candle, source);
     if (live) {
       notifyDiscord(`**M15 candle closed: ${this.symbol}**\nTime: ${candle.time}\nO: ${candle.open} | H: ${candle.high} | L: ${candle.low} | C: ${candle.close}`);
     }
@@ -297,9 +336,10 @@ export class LiveStrategyService {
     }
   }
 
-  async _processM5(candle, live) {
+  async _processM5(candle, live, source = "tick") {
     const normalized = { ...candle, index: ++this.fiveMinuteIndex };
     const newFvgs = this.fvg5m.onCandle(normalized, normalized.index);
+    this._recordProcessedCandle("M5", candle, source);
     if (live) {
       notifyDiscord(`**M5 candle closed: ${this.symbol}**\nTime: ${candle.time}\nO: ${candle.open} | H: ${candle.high} | L: ${candle.low} | C: ${candle.close}`);
     }
@@ -345,6 +385,23 @@ export class LiveStrategyService {
       }
       if (hadOpenTrade) await this.tradeManager.onClosedM5Candle(candle);
     }
+  }
+
+  _recordProcessedCandle(timeframe, candle, source) {
+    if (source !== "tick" && source !== "historical") {
+      throw new Error(`Unsupported ${timeframe} candle source: ${source}`);
+    }
+    const timestamp = candle.timestamp ?? brokerTimestamp(candle.time);
+    if (!Number.isFinite(timestamp)) {
+      throw new Error(`Cannot record ${timeframe} candle with invalid timestamp: ${candle.time}`);
+    }
+
+    const key = `${timeframe}:${timestamp}:${source}`;
+    this.processedCandleSet.set(key, {
+      timeframe,
+      source,
+      candle: { ...candle, timestamp }
+    });
   }
 }
 

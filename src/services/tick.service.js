@@ -6,7 +6,7 @@ import {
   initStreamingConnection,
   closeStreamingConnection
 } from "../connection/metaapi.js";
-import { brokerTimestamp } from "./candleReconciliation.js";
+import { brokerTimestamp, isNewerBrokerTimestamp } from "./candleReconciliation.js";
 
 const { SynchronizationListener } = pkg;
 
@@ -17,6 +17,8 @@ const WATCHDOG_INTERVAL_MS = 15_000;
 const RESUBSCRIBE_WAIT_MS = 30_000;
 const RECOVERY_COOLDOWN_MS = 300_000;
 const TICK_LOG_INTERVAL_MS = 30_000;
+const START_RETRY_BASE_MS = 5_000;
+const START_RETRY_MAX_MS = 60_000;
 
 let streamingConnection = null;
 let tickHandler = null;
@@ -42,9 +44,14 @@ let lastRecoveryAt = 0;
 let lastPriceKey = null;
 let lastTickLogAt = 0;
 let lastKnownBrokerTimestamp = null;
+let freshTickSequence = 0;
 
 const sleep = (ms) =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+export function startupRetryDelay(attempt) {
+  return Math.min(START_RETRY_BASE_MS * (2 ** Math.max(0, attempt)), START_RETRY_MAX_MS);
+}
 
 function enqueuePrice(price) {
   const work = priceProcessing.then(() => processPrice(price));
@@ -80,14 +87,33 @@ async function processPrice(price) {
   }
 
   const now = Date.now();
+  const brokerTime = brokerTimestamp(price.brokerTime ?? price.time ?? price.timeMsc);
 
   if (!recoveryPending && lastTickAt && now - lastTickAt >= NO_TICK_TIMEOUT_MS) {
     await beginRecovery("tick-gap");
   }
 
-  // A genuine price callback is the only thing that
-  // proves market-data delivery has resumed.
-  lastTickAt = now;
+  const isFreshAfterRecovery = recoveryPending &&
+    isNewerBrokerTimestamp(brokerTime, recoveryFromBrokerTimestamp);
+  const advancesKnownTime = isNewerBrokerTimestamp(brokerTime, lastKnownBrokerTimestamp);
+
+  if (recoveryPending && !isFreshAfterRecovery) {
+    console.warn(
+      `[tick] Ignoring stale recovery quote; broker timestamp ${brokerTime ?? "invalid"} ` +
+      `is not newer than recovery baseline ${recoveryFromBrokerTimestamp ?? "unknown"}.`
+    );
+    return;
+  }
+
+  if (advancesKnownTime) {
+    lastKnownBrokerTimestamp = brokerTime;
+    freshTickSequence += 1;
+  }
+
+  // Only a strictly advancing broker timestamp proves feed progress.
+  if (advancesKnownTime) {
+    lastTickAt = now;
+  }
 
   // Avoid printing every tick and filling PM2 logs.
   if (now - lastTickLogAt >= TICK_LOG_INTERVAL_MS) {
@@ -100,9 +126,8 @@ async function processPrice(price) {
     lastTickLogAt = now;
   }
 
-  const resumeTimestamp = brokerTimestamp(price.brokerTime ?? price.time ?? price.timeMsc);
   if (recoveryPending) {
-    if (resumeTimestamp === null) {
+    if (brokerTime === null) {
       console.error("❌ Cannot reconcile recovered stream: tick has no valid broker timestamp.");
       return;
     }
@@ -110,15 +135,13 @@ async function processPrice(price) {
       type: "recovery-tick",
       reason: "fresh-market-data",
       lastBrokerTimestamp: recoveryFromBrokerTimestamp,
-      resumeTimestamp,
+      resumeTimestamp: brokerTime,
       price
     });
     if (!reconciled) return;
     recoveryPending = false;
-    lastKnownBrokerTimestamp = resumeTimestamp;
-    console.info(`[tick] Recovery reconciliation confirmed through ${new Date(resumeTimestamp).toISOString()}.`);
-  } else if (resumeTimestamp !== null) {
-    lastKnownBrokerTimestamp = Math.max(lastKnownBrokerTimestamp ?? resumeTimestamp, resumeTimestamp);
+    recoveryFromBrokerTimestamp = null;
+    console.info(`[tick] Recovery reconciliation confirmed through ${new Date(brokerTime).toISOString()}.`);
   }
 
   if (typeof tickHandler === "function") await tickHandler(price);
@@ -178,7 +201,8 @@ class TickSynchronizationListener extends SynchronizationListener {
       "🔄 Stream synchronization started:",
       instanceIndex
     );
-    if (started) await beginRecovery("stream-resynchronization");
+    // A replica resync is not proof that symbol prices stopped. Let the
+    // tick watchdog decide whether the overall feed is actually stale.
   }
 
   async onBrokerConnectionStatusChanged(
@@ -255,73 +279,72 @@ export async function startTickStream() {
   }
 
   starting = true;
+  let attempt = 0;
 
-  try {
-    streamingConnection = await initStreamingConnection(
-      synchronizationListener
-    );
-
-    console.log(`⏳ Subscribing to ${SYMBOL}...`);
-
-    await streamingConnection.subscribeToMarketData(SYMBOL);
-
-    // Do not set lastTickAt here. A subscription resolving
-    // does not prove that a price has been delivered.
-    subscriptionStartedAt = Date.now();
-    lastPriceKey = null;
-    lastRecoveryAt = 0;
-    lastTickLogAt = 0;
-    lastKnownBrokerTimestamp = null;
-    recoveryFromBrokerTimestamp = null;
-    recoveryPending = false;
-
-    started = true;
-
-    watchdogTimer = setInterval(() => {
-      checkTickHealth().catch((error) => {
-        console.error("❌ Tick watchdog error:", error);
-      });
-    }, WATCHDOG_INTERVAL_MS);
-
-    console.log(`✅ Subscribed to ${SYMBOL}`);
-    console.log(
-      "🟢 Live tick stream running; waiting for actual prices..."
-    );
-  } catch (error) {
-    console.error(
-      "❌ Tick stream startup failed:",
-      error
-    );
-
-    started = false;
-    streamingConnection = null;
-
-    if (watchdogTimer) {
-      clearInterval(watchdogTimer);
-      watchdogTimer = null;
-    }
-
+  while (!started) {
     try {
-      await closeStreamingConnection();
-    } catch (closeError) {
-      console.error(
-        "⚠️ Streaming cleanup failed:",
-        closeError.message
-      );
-    }
+      await startTickStreamAttempt();
+      attempt = 0;
+    } catch (error) {
+      started = false;
+      streamingConnection = null;
 
-    throw error;
-  } finally {
-    starting = false;
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer);
+        watchdogTimer = null;
+      }
+
+      try {
+        await closeStreamingConnection();
+      } catch (closeError) {
+        console.error("⚠️ Streaming cleanup failed:", closeError.message);
+      }
+
+      const delay = startupRetryDelay(attempt++);
+      console.error(`❌ Tick stream startup failed: ${error.message}`);
+      console.warn(`[tick] Will retry streaming startup in ${Math.round(delay / 1000)} seconds.`);
+      await sleep(delay);
+    }
   }
+
+  starting = false;
+}
+
+async function startTickStreamAttempt() {
+  streamingConnection = await initStreamingConnection(synchronizationListener);
+  console.log(`⏳ Subscribing to ${SYMBOL}...`);
+
+  const sequenceAtSubscription = freshTickSequence;
+  await streamingConnection.subscribeToMarketData(
+    SYMBOL,
+    [{ type: "quotes" }],
+    RESUBSCRIBE_WAIT_MS / 1000,
+    false
+  );
+
+  subscriptionStartedAt = Date.now();
+  started = true;
+  watchdogTimer = setInterval(() => {
+    checkTickHealth().catch(error => console.error("❌ Tick watchdog error:", error));
+  }, WATCHDOG_INTERVAL_MS);
+
+  console.log(`[tick] Quote subscription accepted for ${SYMBOL}; waiting for an actual fresh broker tick.`);
+  await sleep(RESUBSCRIBE_WAIT_MS);
+  if (!started) throw new Error("Tick stream was stopped while waiting for the first quote.");
+  if (freshTickSequence === sequenceAtSubscription) {
+    throw new Error(`No fresh ${SYMBOL} broker quote received within ${RESUBSCRIBE_WAIT_MS / 1000} seconds.`);
+  }
+
+  lastRecoveryAt = 0;
+  lastTickLogAt = 0;
+  console.log(`✅ Fresh ${SYMBOL} broker quote received; live tick stream is active.`);
 }
 
 async function checkTickHealth() {
   if (
     !started ||
     starting ||
-    recovering ||
-    !streamingConnection
+    recovering
   ) {
     return;
   }
@@ -379,11 +402,10 @@ async function recoverTickStream() {
           return;
         }
 
-        await current.subscribeToMarketData(SYMBOL);
+        const freshTickSequenceAtSubscribe = freshTickSequence;
+        await current.subscribeToMarketData(SYMBOL, [{ type: "quotes" }], RESUBSCRIBE_WAIT_MS / 1000, false);
 
-        const recoveryStartedAt = Date.now();
-
-        subscriptionStartedAt = recoveryStartedAt;
+        subscriptionStartedAt = Date.now();
 
         console.log(
           `⏳ Waiting up to ${
@@ -397,9 +419,9 @@ async function recoverTickStream() {
           return;
         }
 
-        if (lastTickAt >= recoveryStartedAt) {
+        if (freshTickSequence > freshTickSequenceAtSubscribe) {
           console.log(
-            `✅ ${SYMBOL} ticks resumed after resubscription`
+            `✅ Fresh ${SYMBOL} broker tick received after resubscription; recovery reconciliation ${recoveryPending ? "still pending" : "complete"}.`
           );
 
           return;
@@ -449,15 +471,26 @@ async function recoverTickStream() {
       return;
     }
 
-    await streamingConnection.subscribeToMarketData(SYMBOL);
+    const freshTickSequenceAtSubscribe = freshTickSequence;
+    await streamingConnection.subscribeToMarketData(
+      SYMBOL,
+      [{ type: "quotes" }],
+      RESUBSCRIBE_WAIT_MS / 1000,
+      false
+    );
 
     // Reset the subscription baseline, not the last actual
     // tick timestamp or recovery cooldown.
     subscriptionStartedAt = Date.now();
 
-    console.log(
-      `✅ Reconnected and subscribed to ${SYMBOL}; waiting for actual ticks`
-    );
+    console.log(`[tick] Quote subscription request accepted for ${SYMBOL}; waiting for a fresh broker timestamp.`);
+
+    await sleep(RESUBSCRIBE_WAIT_MS);
+    if (freshTickSequence > freshTickSequenceAtSubscribe) {
+      console.log(`[tick] Fresh ${SYMBOL} broker tick arrived on rebuilt connection; reconciliation ${recoveryPending ? "pending" : "complete"}.`);
+    } else {
+      console.error(`[tick] No fresh ${SYMBOL} broker tick arrived after rebuilding the streaming connection.`);
+    }
   } catch (error) {
     console.error(
       "❌ Streaming recovery failed:",
@@ -504,6 +537,8 @@ export async function stopTickStream() {
   lastRecoveryAt = 0;
   lastTickLogAt = 0;
   lastKnownBrokerTimestamp = null;
+  freshTickSequence = 0;
+  freshTickSequence = 0;
   recoveryFromBrokerTimestamp = null;
   recoveryPending = false;
   priceProcessing = Promise.resolve();

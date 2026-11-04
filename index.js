@@ -8,7 +8,7 @@ import { initRiskManager } from "./src/services/risk.service.js";
 import { startLiveStrategy } from "./src/services/liveStrategy.service.js";
 import app from "./src/app.js";
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5200;
 
 async function bootstrap() {
   try {
@@ -49,13 +49,15 @@ async function bootstrap() {
     // Consume only fully completed candles from the live tick-built feed.
     onCandle((timeframe, candle) => strategy.handleClosedCandle(timeframe, candle));
 
-    // Build both 5-minute and 15-minute candles from the live tick stream.
-    onTick(handleTick);
-    await startTickStream();
-
-    // 2. Start Express server
+    // Keep the API available while MetaApi's streaming replicas recover.
     app.listen(PORT, () => {
       console.log(`🚀 Server running at http://localhost:${PORT}`);
+    });
+
+    // Build both 5-minute and 15-minute candles from the live tick stream.
+    onTick(handleTick);
+    startTickStream().catch(error => {
+      console.error("❌ Tick stream retry loop stopped unexpectedly:", error);
     });
 
   } catch (err) {
