@@ -36,7 +36,8 @@ async function bootstrap() {
         await completeCandleRecovery({
           fromTimestamp: result.lastBrokerTimestamp,
           resumeTimestamp: result.resumeTimestamp,
-          repairedThrough: result.repairedThrough
+          repairedThrough: result.repairedThrough,
+          pendingValidation: result.pendingValidation
         });
         return true;
       } catch (error) {

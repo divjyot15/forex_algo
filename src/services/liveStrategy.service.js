@@ -5,6 +5,7 @@ import { sendDiscord } from "./discord.service.js";
 import { LiveTradeManager } from "./liveTradeManager.service.js";
 import {
   brokerTimestamp,
+  bucketStart,
   completedBucketRange,
   sortCandleEvents,
   timeframeMilliseconds,
@@ -71,6 +72,8 @@ export class LiveStrategyService {
     this.journalKeys = new Set();
     this.processedCandleSet = new Map();
     this.startupInitialBuckets = { M5: null, M15: null };
+    this.pendingRecoveryBuckets = new Set();
+    this.deferredCandles = new Map();
   }
 
   async initialize() {
@@ -128,6 +131,14 @@ export class LiveStrategyService {
       throw new Error("Recovery is missing a valid, ordered broker timestamp interval.");
     }
 
+    const pendingValidation = {
+      M5: [bucketStart(resumeTimestamp, "M5")],
+      M15: [bucketStart(resumeTimestamp, "M15")]
+    };
+    for (const timeframe of ["M5", "M15"]) {
+      this.pendingRecoveryBuckets.add(`${timeframe}:${pendingValidation[timeframe][0]}`);
+    }
+
     const repaired = [];
     const repairedThrough = {};
     for (const [timeframe, apiTimeframe] of [["M5", "5m"], ["M15", "15m"]]) {
@@ -152,10 +163,8 @@ export class LiveStrategyService {
     }
 
     if (!repaired.length) {
-      this.reconciliationPending = false;
-      this.tradeManager.setEntriesEnabled?.(true);
-      console.info("[strategy] Recovery contained no completed M5/M15 buckets; affected partial candles will be discarded.");
-      return { lastBrokerTimestamp, resumeTimestamp, repairedThrough };
+      console.info("[strategy] No completed buckets fell inside the outage; resumed M5/M15 buckets will be validated against history when they close.");
+      return { lastBrokerTimestamp, resumeTimestamp, repairedThrough, pendingValidation };
     }
 
     console.info(`[recovery] Verified historical candles for ${this.symbol}:`);
@@ -219,10 +228,8 @@ export class LiveStrategyService {
       logProcessedCandleAudit(timeframe, this.getProcessedCandles(timeframe));
     }
 
-    this.reconciliationPending = false;
-    this.tradeManager.setEntriesEnabled?.(true);
-    console.info(`[strategy] Reconciled ${repaired.length} authoritative candles and replayed ${replay.length} candles without trade execution.`);
-    return { lastBrokerTimestamp, resumeTimestamp, repairedThrough };
+    console.info(`[strategy] Reconciled ${repaired.length} completed authoritative candles; resumed buckets still require close-time validation.`);
+    return { lastBrokerTimestamp, resumeTimestamp, repairedThrough, pendingValidation };
   }
 
   handleClosedCandle(timeframe, candle) {
@@ -230,10 +237,44 @@ export class LiveStrategyService {
       if (!this.initialized) throw new Error("Live strategy received a candle before initialization completed.");
       if (timeframe !== "M5" && timeframe !== "M15") return;
       if (candle.symbol && candle.symbol !== this.symbol) return;
-      if (this.reconciliationPending) throw new Error("Refusing to process a live candle while recovery reconciliation is pending.");
       const timestamp = candle.timestamp ?? brokerTimestamp(candle.time);
       const journalKey = `${timeframe}:${timestamp}`;
       if (!Number.isFinite(timestamp) || this.journalKeys.has(journalKey)) return;
+
+      if (this.reconciliationPending) {
+        if (candle.recoveryValidationRequired) {
+          this._recordProcessedCandle(timeframe, candle, "tick");
+          const apiTimeframe = timeframe === "M5" ? "5m" : "15m";
+          const raw = await this.historicalCandleFetcher(
+            this.symbol,
+            apiTimeframe,
+            new Date(timestamp + timeframeMilliseconds(timeframe)),
+            5
+          );
+          const [historical] = validateHistoricalCoverage(raw, timeframe, this.symbol, [timestamp]);
+          const record = {
+            timeframe,
+            source: "historical",
+            candle: { ...historical }
+          };
+          this.processedCandleSet.set(`${journalKey}:historical`, record);
+          this.deferredCandles.set(journalKey, record);
+          this.pendingRecoveryBuckets.delete(journalKey);
+          console.info(`[recovery] Verified resumed ${timeframe} bucket ${historical.brokerTime}; buffering candles until all affected timeframes verify.`);
+        } else {
+          this.deferredCandles.set(journalKey, {
+            timeframe,
+            source: "tick",
+            candle: { ...candle, timestamp }
+          });
+        }
+
+        if (this.pendingRecoveryBuckets.size === 0) {
+          await this._finalizeDeferredRecovery();
+        }
+        return;
+      }
+
       if (timeframe === "M5") await this._processM5(candle, true, "tick");
       else this._processM15(candle, true, "tick");
       const record = {
@@ -248,6 +289,41 @@ export class LiveStrategyService {
       console.error(`[strategy] Failed processing ${timeframe} candle ${candle?.time}:`, error);
     });
     return work;
+  }
+
+  async _finalizeDeferredRecovery() {
+    const merged = new Map(this.candleJournal.map(event => [
+      `${event.timeframe}:${event.candle.timestamp}`,
+      event
+    ]));
+    for (const [key, event] of this.deferredCandles) merged.set(key, event);
+
+    const replay = sortCandleEvents([...merged.values()]);
+    this.candleJournal = replay.map(event => ({
+      timeframe: event.timeframe,
+      source: event.source ?? "tick",
+      candle: { ...event.candle }
+    }));
+    this.journalKeys = new Set(this.candleJournal.map(event =>
+      `${event.timeframe}:${event.candle.timestamp}`
+    ));
+
+    this.market = new MarketStructureEngine({ zigzagLength: this.market.zigzag.length });
+    this.fvg5m = new FVGTracker();
+    this.watcher = new FiveMinuteEntryWatcher();
+    this.fiveMinuteIndex = -1;
+    for (const event of replay) {
+      if (event.timeframe === "M5") await this._processM5(event.candle, false, event.source);
+      else this._processM15(event.candle, false, event.source);
+    }
+
+    for (const timeframe of ["M5", "M15"]) {
+      logProcessedCandleAudit(timeframe, this.getProcessedCandles(timeframe));
+    }
+    this.deferredCandles.clear();
+    this.reconciliationPending = false;
+    this.tradeManager.setEntriesEnabled?.(true);
+    console.info(`[strategy] All resumed buckets verified; rebuilt state from ${replay.length} candles without historical trade execution.`);
   }
 
   getProcessedCandles(timeframe = null) {

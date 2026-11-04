@@ -128,6 +128,10 @@ const processedTicks =
 
 let recoveryPending = false;
 let tickProcessing = Promise.resolve();
+const recoveryValidationBuckets = {
+    M5: new Set(),
+    M15: new Set()
+};
 
 
 // =============================================================================
@@ -197,21 +201,10 @@ async function emitCandle(
         of candleListeners
     ) {
 
-        try {
-
-            await listener(
-                timeframe,
-                candle
-            );
-
-        } catch (error) {
-
-            console.error(
-                `❌ ${timeframe} candle listener error:`,
-                error
-            );
-
-        }
+        await listener(
+            timeframe,
+            candle
+        );
 
     }
 
@@ -948,20 +941,32 @@ async function closeCandle(timeframeName, timestamp) {
     const candle = timeframeCandles.get(timestamp);
     if (!candle) return;
 
-    timeframeCandles.delete(timestamp);
-
-    if (timestamp === initialBuckets[timeframeName]) {
+    if (
+        timestamp === initialBuckets[timeframeName] &&
+        !recoveryValidationBuckets[timeframeName].has(timestamp)
+    ) {
         console.log(`⚠️ Ignoring initial partial ${timeframeName} candle:`, formatBrokerTime(timestamp));
+        timeframeCandles.delete(timestamp);
         lastClosedTimestamp[timeframeName] = timestamp;
         return;
     }
 
-    lastClosedTimestamp[timeframeName] = timestamp;
+    const requiresHistoricalValidation = recoveryValidationBuckets[timeframeName].has(timestamp);
+    const emittedCandle = requiresHistoricalValidation
+        ? { ...candle, recoveryValidationRequired: true }
+        : candle;
     console.log(`\n🕯️ ${timeframeName} CLOSED`);
     console.log(`Time: ${candle.brokerTime}`);
     console.log(`O: ${candle.open} H: ${candle.high} L: ${candle.low} C: ${candle.close}`);
     console.log(`Ticks: ${candle.tickCount}`);
-    await emitCandle(timeframeName, candle);
+    if (requiresHistoricalValidation) {
+        console.warn(`⚠️ ${timeframeName} ${candle.brokerTime} awaits historical verification after stream recovery.`);
+    }
+    await emitCandle(timeframeName, emittedCandle);
+
+    timeframeCandles.delete(timestamp);
+    recoveryValidationBuckets[timeframeName].delete(timestamp);
+    lastClosedTimestamp[timeframeName] = timestamp;
 }
 
 export function beginCandleRecovery() {
@@ -969,7 +974,7 @@ export function beginCandleRecovery() {
     return { ...startupInitialBuckets };
 }
 
-export async function completeCandleRecovery({ fromTimestamp, resumeTimestamp, repairedThrough }) {
+export async function completeCandleRecovery({ fromTimestamp, resumeTimestamp, repairedThrough, pendingValidation = {} }) {
     if (!Number.isFinite(fromTimestamp) || !Number.isFinite(resumeTimestamp)) {
         throw new Error("Candle recovery requires valid broker timestamps.");
     }
@@ -985,7 +990,9 @@ export async function completeCandleRecovery({ fromTimestamp, resumeTimestamp, r
         if (Number.isFinite(repairedTimestamp)) {
             lastClosedTimestamp[timeframeName] = Math.max(lastClosedTimestamp[timeframeName] ?? -Infinity, repairedTimestamp);
         }
-        initialBuckets[timeframeName] = getCandleBucket(resumeTimestamp, TIMEFRAMES[timeframeName]);
+        for (const timestamp of pendingValidation[timeframeName] ?? []) {
+            recoveryValidationBuckets[timeframeName].add(timestamp);
+        }
     }
 
     recoveryPending = false;
